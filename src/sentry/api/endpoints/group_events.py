@@ -11,12 +11,17 @@ from sentry import quotas, tagstore
 from sentry.api.base import DocSection, EnvironmentMixin
 from sentry.api.bases import GroupEndpoint
 from sentry.api.serializers import serialize
-from sentry.api.paginator import DateTimePaginator
+from sentry.api.paginator import DateTimePaginator, GenericOffsetPaginator, Paginator
 from sentry.models import Environment, Event, Group
 from sentry.search.utils import parse_query
 from sentry.utils.apidocs import scenario, attach_scenarios
 from sentry.search.utils import InvalidQuery
+from sentry.utils.validators import is_event_id
 
+EMPTY_RESULT = Paginator(Group.objects.none()).get_result()
+
+class InvalidQuery(Exception):
+    pass
 
 @scenario('ListAvailableSamples')
 def list_available_samples_scenario(runner):
@@ -38,25 +43,109 @@ class GroupEventsEndpoint(GroupEndpoint, EnvironmentMixin):
         :pparam string issue_id: the ID of the issue to retrieve.
         :auth: required
         """
+        backend = 'snuba'
+        return {
+            'legacy': self._get_events_legacy,
+            'snuba': self._get_events_snuba,
+        }[backend](request, group)
 
-        def respond(queryset):
-            return self.paginate(
-                request=request,
-                queryset=queryset,
-                order_by='-datetime',
-                on_results=lambda x: serialize(x, request.user),
-                paginator_cls=DateTimePaginator,
-            )
+
+    def _get_events_snuba(self, request, group):
+        from functools32 import partial
+        from sentry.api.paginator import GenericOffsetPaginator
+        from sentry.api.serializers.models.event import SnubaEvent
+        from sentry.utils.snuba import raw_query
+
+        conditions = []
+        query, tags = self._get_search_query_and_tags(request)
+        if query:
+            message_condition = [['positionCaseInsensitive', ['message', "'%s'" % (query,)]], '!=', 0]
+            if is_event_id(query):
+                or_condition = [message_condition, ['event_id', '=', query]]
+                conditions.append(or_condition)
+            else:
+                conditions.append(message_condition)
+
+        if tags:
+            tag_conditions = [[u'tags[{}]'.format(k), '=', v] for (k, v) in tags.items()]
+            
+
+        now = timezone.now()
+        data_fn = partial(
+            # extract 'data' from raw_query result
+            lambda *args, **kwargs: raw_query(*args, **kwargs)['data'],
+            start=now - timedelta(days=90),
+            end=now,
+            conditions=conditions,
+            filter_keys={
+                'project_id': [group.project_id],
+                'issue': [group.id]
+            },
+            selected_columns=SnubaEvent.selected_columns,
+            orderby='-timestamp',
+            referrer='api.project-events',
+        )
+
+        return self.paginate(
+            request=request,
+            on_results=lambda results: serialize(
+                [SnubaEvent(row) for row in results], request.user),
+            paginator=GenericOffsetPaginator(data_fn=data_fn)
+        )
+
+
+    def _get_events_legacy(self, request, group):
+        try:
+            query, tags = self._get_search_query_and_tags(request)
+        except InvalidQuery:
+            return EMPTY_RESULT
 
         events = Event.objects.filter(group_id=group.id)
 
+        if query:
+            q = Q(message__icontains=query)
+
+            if is_event_id(query) == 32:
+                q |= Q(event_id__exact=query)
+
+            events = events.filter(q)
+
+        if tags:
+            event_filter = tagstore.get_group_event_filter(
+                group.project_id,
+                group.id,
+                environment.id if environment is not None else None,
+                tags,
+            )
+
+            if not event_filter:
+                return EMPTY_RESULT
+
+            events = events.filter(**event_filter)
+
+        # filter out events which are beyond the retention period
+        retention = quotas.get_event_retention(organization=group.project.organization)
+        if retention:
+            events = events.filter(
+                datetime__gte=timezone.now() - timedelta(days=retention)
+            )
+
+        return self.paginate(
+            request=request,
+            queryset=events,
+            order_by='-datetime',
+            on_results=lambda x: serialize(x, request.user),
+            paginator_cls=DateTimePaginator,
+        )
+
+    def _get_search_query_and_tags(self, request, group):
         try:
             environment = self._get_environment_from_request(
                 request,
                 group.project.organization_id,
             )
         except Environment.DoesNotExist:
-            return respond(events.none())
+            raise InvalidQuery()
 
         raw_query = request.GET.get('query')
 
@@ -79,40 +168,8 @@ class GroupEventsEndpoint(GroupEndpoint, EnvironmentMixin):
                 # the request is different than the environment
                 # provided as a tag lookup, the query cannot contain
                 # any valid results.
-                return respond(events.none())
+                raise InvalidQuery()
             else:
                 tags['environment'] = environment.name
 
-        if query:
-            q = Q(message__icontains=query)
-
-            if len(query) == 32:
-                q |= Q(event_id__exact=query)
-
-            events = events.filter(q)
-
-        # TODO currently snuba can be used to get this filter of event_ids matching
-        # the search tags, which is then used to further filter a postgres QuerySet
-        # Ideally we would just use snuba to completely replace the fetching of the
-        # events.
-        if tags:
-            event_filter = tagstore.get_group_event_filter(
-                group.project_id,
-                group.id,
-                environment.id if environment is not None else None,
-                tags,
-            )
-
-            if not event_filter:
-                return respond(events.none())
-
-            events = events.filter(**event_filter)
-
-        # filter out events which are beyond the retention period
-        retention = quotas.get_event_retention(organization=group.project.organization)
-        if retention:
-            events = events.filter(
-                datetime__gte=timezone.now() - timedelta(days=retention)
-            )
-
-        return respond(events)
+        return query, tags
